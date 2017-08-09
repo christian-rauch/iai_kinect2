@@ -47,6 +47,8 @@
 
 #include <compressed_depth_image_transport/compression_common.h>
 
+#include <cv_bridge/cv_bridge.h>
+
 #include <libfreenect2/libfreenect2.hpp>
 #include <libfreenect2/frame_listener_impl.h>
 #include <libfreenect2/packet_pipeline.h>
@@ -84,6 +86,8 @@ private:
   libfreenect2::Registration *registration;
   libfreenect2::Freenect2Device::ColorCameraParams colorParams;
   libfreenect2::Freenect2Device::IrCameraParams irParams;
+  
+  libfreenect2::Frame *depth_to_colour; // bigdepth
 
   ros::NodeHandle nh, priv_nh;
 
@@ -132,6 +136,7 @@ private:
   ros::Publisher infoHDPub, infoQHDPub, infoIRPub;
   sensor_msgs::CameraInfo infoHD, infoQHD, infoIR;
   std::vector<Status> status;
+  ros::Publisher bigdepth_pub;
 
 public:
   Kinect2Bridge(const ros::NodeHandle &nh = ros::NodeHandle(), const ros::NodeHandle &priv_nh = ros::NodeHandle("~"))
@@ -140,6 +145,12 @@ public:
       nextIrDepth(false), depthShift(0), running(false), deviceActive(false), clientConnected(false)
   {
     status.resize(COUNT, UNSUBCRIBED);
+    depth_to_colour = new libfreenect2::Frame(1920, 1082, 4);
+    depth_to_colour->format = libfreenect2::Frame::Float;
+  }
+  
+  ~Kinect2Bridge() {
+      delete depth_to_colour;
   }
 
   bool start()
@@ -370,6 +381,10 @@ private:
       delete depthRegHighRes;
       return false;
     }
+    
+    std::cout << "registration parameters" << std::endl;
+    std::cout << "IR f " << irParams.fx << "," << irParams.fy << std::endl;
+    std::cout << "Col f " << colorParams.fx << "," << colorParams.fy << std::endl;
 
     registration = new libfreenect2::Registration(irParams, colorParams);
 
@@ -507,6 +522,8 @@ private:
     imagePubs.resize(COUNT);
     compressedPubs.resize(COUNT);
     ros::SubscriberStatusCallback cb = boost::bind(&Kinect2Bridge::callbackStatus, this);
+    
+    bigdepth_pub = nh.advertise<sensor_msgs::Image>("/kinect2/bigdepth", queueSize);
 
     for(size_t i = 0; i < COUNT; ++i)
     {
@@ -1175,9 +1192,10 @@ private:
       libfreenect2::Frame undistorted(sizeIr.width, sizeIr.height, 4);
       libfreenect2::Frame registered(sizeIr.width, sizeIr.height, 4);
       lockRegSD.lock();
-      registration->apply(&color, &depthFrame, &undistorted, &registered);
+      registration->apply(&color, &depthFrame, &undistorted, &registered, true, depth_to_colour);
       lockRegSD.unlock();
       cv::flip(cv::Mat(sizeIr, CV_8UC4, registered.data), tmp, 1);
+      
       if(color.format == libfreenect2::Frame::BGRX)
       {
         cv::cvtColor(tmp, images[COLOR_SD_RECT], CV_BGRA2BGR);
@@ -1269,6 +1287,20 @@ private:
     std::vector<sensor_msgs::CompressedImagePtr> compressedMsgs(COUNT);
     sensor_msgs::CameraInfoPtr infoHDMsg,  infoQHDMsg,  infoIRMsg;
     std_msgs::Header _header = header;
+    
+    if(end==COLOR_HD) {
+        // IR publsihing
+        lockRegSD.lock();
+        cv_bridge::CvImage depth_to_colour_mat_cvimg;
+        cv::Mat depth_to_colour_mat(depth_to_colour->height, depth_to_colour->width, CV_32FC1, depth_to_colour->data);
+        cv::flip(depth_to_colour_mat, depth_to_colour_mat, 1);
+        depth_to_colour_mat_cvimg.image = cv::Mat(depth_to_colour->height, depth_to_colour->width, CV_16UC1);
+        depth_to_colour_mat.convertTo(depth_to_colour_mat_cvimg.image, CV_16UC1);
+        depth_to_colour_mat_cvimg.encoding = "mono16";
+        depth_to_colour_mat_cvimg.header = header;
+        bigdepth_pub.publish(depth_to_colour_mat_cvimg.toImageMsg());
+        lockRegSD.unlock();
+    }
 
     if(begin < COLOR_HD)
     {
